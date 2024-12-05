@@ -938,13 +938,12 @@ pub async fn snapshot_from_lockfile<'a>(
     .collect::<Vec<_>>();
   let get_version_infos = || {
     FuturesOrdered::from_iter(pkg_nvs.iter().map(|nv| async move {
-      let package_info = api
-        .package_info(&nv.name)
-        .await
-        .map_err(SnapshotFromLockfileError::PackageInfoLoad)?;
-      package_info
-        .version_info(nv)
-        .map_err(|e| SnapshotFromLockfileError::VersionNotFound { source: e })
+      api.version_info(nv).await.map_err(|e| match e {
+        NpmRegistryPackageInfoLoadError::VersionNotFound(e) => {
+          SnapshotFromLockfileError::VersionNotFound { source: e }
+        }
+        other => SnapshotFromLockfileError::PackageInfoLoad(other),
+      })
     }))
   };
   let mut version_infos = get_version_infos();

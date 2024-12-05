@@ -348,6 +348,8 @@ pub enum NpmRegistryPackageInfoLoadError {
   PackageNotExists { package_name: String },
   #[error(transparent)]
   LoadError(#[from] Arc<anyhow::Error>),
+  #[error(transparent)]
+  VersionNotFound(#[from] NpmPackageVersionNotFound),
 }
 
 /// A trait for getting package information from the npm registry.
@@ -374,6 +376,14 @@ pub trait NpmRegistryApi {
   /// - "force reload" flag is successfully set for the first time
   fn mark_force_reload(&self) -> bool {
     false
+  }
+
+  async fn version_info(
+    &self,
+    nv: &PackageNv,
+  ) -> Result<NpmPackageVersionInfo, NpmRegistryPackageInfoLoadError> {
+    let info = self.package_info(&nv.name).await?;
+    Ok(info.version_info(nv)?)
   }
 }
 
