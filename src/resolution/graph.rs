@@ -20,6 +20,7 @@ use std::rc::Rc;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
+use crate::registry::LazyNpmPackageInfo;
 use crate::registry::NpmDependencyEntry;
 use crate::registry::NpmDependencyEntryError;
 use crate::registry::NpmDependencyEntryKind;
@@ -639,9 +640,8 @@ impl Graph {
       // at this point the api should have this cached
       let package_info = api.package_info(&pkg_id.nv.name).await?;
       let version_info = package_info
-        .versions
-        .get(&pkg_id.nv.version)
-        .unwrap_or_else(|| panic!("missing: {:?}", pkg_id.nv));
+        .version_info(&pkg_id.nv.version)
+        .unwrap_or_else(|_| panic!("missing: {:?}", pkg_id.nv));
 
       let mut dependencies = HashMap::with_capacity(node.children.len());
       for (specifier, child_id) in &node.children {
@@ -827,7 +827,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   pub fn add_package_req(
     &mut self,
     package_req: &PackageReq,
-    package_info: &NpmPackageInfo,
+    package_info: &LazyNpmPackageInfo,
   ) -> Result<Rc<PackageNv>, NpmResolutionError> {
     if let Some(nv) = self.graph.get_req_nv(package_req) {
       return Ok(nv.clone()); // already added
@@ -853,7 +853,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn analyze_dependency(
     &mut self,
     entry: &NpmDependencyEntry,
-    package_info: &NpmPackageInfo,
+    package_info: &LazyNpmPackageInfo,
     parent_path: &Rc<GraphPath>,
   ) -> Result<NodeId, NpmResolutionError> {
     debug_assert_eq!(entry.kind, NpmDependencyEntryKind::Dep);
@@ -894,7 +894,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &mut self,
     pkg_req_name: &str,
     version_req: &VersionReq,
-    package_info: &NpmPackageInfo,
+    package_info: &LazyNpmPackageInfo,
     parent_id: Option<NodeId>,
   ) -> Result<(Rc<PackageNv>, NodeId), NpmResolutionError> {
     let info = self.version_resolver.resolve_best_package_version_info(
@@ -907,6 +907,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         .or_default()
         .iter(),
     )?;
+    let info = info.clone();
     let resolved_id = ResolvedId {
       nv: Rc::new(PackageNv {
         name: package_info.name.clone(),
@@ -920,7 +921,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     let has_deps = if let Some(deps) = self.dep_entry_cache.get(&pkg_nv) {
       !deps.is_empty()
     } else {
-      let deps = self.dep_entry_cache.store(pkg_nv.clone(), info)?;
+      let deps = self.dep_entry_cache.store(pkg_nv.clone(), &info)?;
       !deps.is_empty()
     };
 
@@ -968,9 +969,10 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           // need to parallelize
           let package_info = self.api.package_info(&pkg_nv.name).await?;
           let version_info = package_info
-            .version_info(&pkg_nv)
-            .map_err(NpmPackageVersionResolutionError::VersionNotFound)?;
-          self.dep_entry_cache.store(pkg_nv.clone(), version_info)?
+            .version_info(&pkg_nv.version)
+            .map_err(NpmPackageVersionResolutionError::LazyNpmPackageInfo)?
+            .clone();
+          self.dep_entry_cache.store(pkg_nv.clone(), &version_info)?
         };
 
         (pkg_nv, deps)
@@ -1118,7 +1120,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &mut self,
     specifier: &StackString,
     peer_dep: &NpmDependencyEntry,
-    peer_package_info: &NpmPackageInfo,
+    peer_package_info: &LazyNpmPackageInfo,
     ancestor_path: &Rc<GraphPath>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     debug_assert!(matches!(
@@ -1205,7 +1207,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &self,
     path: &Rc<GraphPath>,
     peer_dep: &NpmDependencyEntry,
-    peer_package_info: &NpmPackageInfo,
+    peer_package_info: &LazyNpmPackageInfo,
     exclude_key: Option<&str>,
   ) -> Result<Option<(GraphPathNodeOrRoot, NodeId)>, NpmResolutionError> {
     let node_id = path.node_id();
@@ -1459,7 +1461,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn find_matching_child<'nv>(
     &self,
     peer_dep: &NpmDependencyEntry,
-    peer_package_info: &NpmPackageInfo,
+    peer_package_info: &LazyNpmPackageInfo,
     children: impl Iterator<Item = (NodeId, &'nv Rc<PackageNv>)>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     for (child_id, pkg_id) in children {

@@ -1,10 +1,13 @@
 // Copyright 2018-2024 the Deno authors. MIT license.
 
+use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::rc::Rc;
+use std::str::Utf8Error;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,6 +32,370 @@ pub struct NpmPackageInfo {
   pub versions: HashMap<Version, NpmPackageVersionInfo>,
   #[serde(rename = "dist-tags")]
   pub dist_tags: HashMap<String, Version>,
+}
+
+pub enum LazyVersionInfo<'a> {
+  Value(NpmPackageVersionInfo),
+  Unparsed(Cow<'a, str>),
+}
+
+impl<'a> LazyVersionInfo<'a> {
+  pub fn as_value(&self) -> Option<&NpmPackageVersionInfo> {
+    match self {
+      LazyVersionInfo::Value(value) => Some(value),
+      LazyVersionInfo::Unparsed(_) => None,
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct LazyNpmPackageInfo {
+  pub name: StackString,
+  pub dist_tags: HashMap<String, Version>,
+  versions: Arc<RwLock<HashMap<Version, NpmPackageVersionInfo>>>,
+  unparsed_versions: Arc<RwLock<HashMap<Version, Box<str>>>>,
+}
+
+impl From<NpmPackageInfo> for LazyNpmPackageInfo {
+  fn from(value: NpmPackageInfo) -> Self {
+    Self {
+      name: value.name.into(),
+      dist_tags: value.dist_tags,
+      versions: Arc::new(RwLock::new(value.versions)),
+      unparsed_versions: Arc::new(RwLock::new(HashMap::new())),
+    }
+  }
+}
+impl From<&NpmPackageInfo> for LazyNpmPackageInfo {
+  fn from(value: &NpmPackageInfo) -> Self {
+    Self {
+      name: value.name.clone().into(),
+      dist_tags: value.dist_tags.clone(),
+      versions: Arc::new(RwLock::new(value.versions.clone())),
+      unparsed_versions: Arc::new(RwLock::new(HashMap::new())),
+    }
+  }
+}
+
+pub struct NpmPackageVersionInfoRef<'a>(
+  parking_lot::MappedRwLockReadGuard<'a, NpmPackageVersionInfo>,
+);
+
+impl Deref for NpmPackageVersionInfoRef<'_> {
+  type Target = NpmPackageVersionInfo;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+impl LazyNpmPackageInfo {
+  #[cfg(test)]
+  pub fn to_eager(&self) -> NpmPackageInfo {
+    let mut versions = HashMap::with_capacity(self.versions.read().len());
+    for (version, info) in self.versions.read().iter() {
+      versions.insert(version.clone(), info.clone());
+    }
+    for (version, string) in self.unparsed_versions.read().iter() {
+      let info: NpmPackageVersionInfo = serde_json::from_str(&string).unwrap();
+      versions.insert(version.clone(), info);
+    }
+    NpmPackageInfo {
+      name: self.name.clone().into(),
+      versions,
+      dist_tags: self.dist_tags.clone(),
+    }
+  }
+  pub fn version_info(
+    &self,
+    version: &Version,
+  ) -> Result<NpmPackageVersionInfoRef<'_>, LazyNpmPackageInfoError> {
+    let should_insert = if self.versions.read().get(&version).is_some() {
+      false
+    } else {
+      true
+    };
+
+    if should_insert {
+      let string =
+        self
+          .unparsed_versions
+          .write()
+          .remove(version)
+          .ok_or_else(|| {
+            NpmPackageVersionNotFound(PackageNv {
+              name: self.name.clone(),
+              version: version.clone(),
+            })
+          })?;
+      let info: NpmPackageVersionInfo =
+        serde_json::from_str(&string).map_err(Arc::new)?;
+      self.versions.write().insert(version.clone(), info);
+    }
+
+    Ok(NpmPackageVersionInfoRef(parking_lot::RwLockReadGuard::map(
+      self.versions.read(),
+      |v| v.get(version).unwrap(),
+    )))
+  }
+
+  pub fn versions(&self) -> impl IntoIterator<Item = Version> {
+    self
+      .versions
+      .read()
+      .keys()
+      .cloned()
+      .chain(self.unparsed_versions.read().keys().cloned())
+      .collect::<Vec<_>>()
+  }
+}
+
+#[derive(Debug, Error, deno_error::JsError, Clone)]
+#[class(type)]
+pub enum LazyNpmPackageInfoError {
+  #[error("{0}")]
+  InvalidString(#[from] Utf8Error),
+  #[error("{0}")]
+  Serde(#[from] Arc<serde_json::Error>),
+  #[error("{0} at {1}")]
+  Unexpected(&'static str, usize),
+  #[error(transparent)]
+  InvalidVersion(#[from] deno_semver::npm::NpmVersionParseError),
+  #[error(transparent)]
+  NotFound(#[from] NpmPackageVersionNotFound),
+}
+
+impl LazyNpmPackageInfo {
+  pub fn from_json_str(
+    s: &str,
+  ) -> Result<LazyNpmPackageInfo, LazyNpmPackageInfoError> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    let mut escape = false;
+    #[derive(Debug, Clone, Copy)]
+    enum State {
+      InString(usize),
+      InObject(usize),
+    }
+
+    let mut name: Option<StackString> = None;
+    let mut state = vec![];
+    let mut dist_tags = None;
+    let mut versions = HashMap::with_capacity(32);
+    let mut object_level = 0;
+    let mut want = None;
+
+    #[derive(Debug, Clone, Copy)]
+    struct Want<'a> {
+      kind: WantKind<'a>,
+      got_colon: bool,
+    }
+    #[derive(Debug, Clone, Copy)]
+    enum WantKind<'a> {
+      Name,
+      DistTags,
+      Versions { want_version_value: Option<&'a str> },
+    }
+
+    impl<'a> WantKind<'a> {
+      fn level(&self) -> usize {
+        match self {
+          WantKind::Name => 1,
+          WantKind::DistTags => 1,
+          WantKind::Versions { .. } => 2,
+        }
+      }
+    }
+
+    while i < bytes.len() {
+      let current = bytes[i];
+      // println!(
+      //   "{}: {:?}, {state:?} {want:?} | {escape}",
+      //   i, current as char
+      // );
+      match current {
+        b'\\' => {
+          escape = !escape;
+        }
+        b'{' => match state.last() {
+          None => {
+            state.push(State::InObject(i));
+            object_level += 1;
+          }
+          Some(State::InString(_)) => {}
+          Some(State::InObject(_)) => {
+            state.push(State::InObject(i));
+            object_level += 1;
+          }
+        },
+        b':' => {
+          if let Some(State::InObject(_)) = state.last() {
+            if let Some(Want { kind, got_colon }) = want {
+              if got_colon && object_level == kind.level() {
+                // println!("got {i} {kind:?}");
+                return Err(LazyNpmPackageInfoError::Unexpected(":", i));
+              }
+              // println!("gotten {i} {kind:?}");
+              want = Some(Want {
+                kind,
+                got_colon: true,
+              });
+            }
+          }
+        }
+        b'"' if !escape => match state.last().copied() {
+          None | Some(State::InObject(_)) => {
+            state.push(State::InString(i + 1));
+          }
+          Some(State::InString(start)) => {
+            let _ = state.pop();
+            if object_level == 1 {
+              // top level object `{ }`, either key or string value
+              match want {
+                None => {
+                  let key_name = std::str::from_utf8(&bytes[start..i])?;
+                  match key_name {
+                    "name" => {
+                      want = Some(Want {
+                        kind: WantKind::Name,
+                        got_colon: false,
+                      });
+                    }
+                    "dist-tags" => {
+                      want = Some(Want {
+                        kind: WantKind::DistTags,
+                        got_colon: false,
+                      });
+                    }
+                    "versions" => {
+                      want = Some(Want {
+                        kind: WantKind::Versions {
+                          want_version_value: None,
+                        },
+                        got_colon: false,
+                      });
+                    }
+                    _ => {}
+                  }
+                }
+                Some(Want {
+                  got_colon: false, ..
+                }) => {
+                  return Err(LazyNpmPackageInfoError::Unexpected("string", i));
+                }
+                Some(Want {
+                  kind: WantKind::Name,
+                  ..
+                }) => {
+                  let value = std::str::from_utf8(&bytes[start..i])?;
+                  name = Some(value.into());
+                  want = None;
+                }
+                _ => {
+                  return Err(LazyNpmPackageInfoError::Unexpected("string", i))
+                }
+              }
+            } else if object_level == 2 {
+              // { "dist-tags": { ... } } or { "versions": { ... } }
+              match want {
+                Some(Want {
+                  kind: WantKind::DistTags,
+                  ..
+                }) => {}
+                Some(Want {
+                  kind:
+                    WantKind::Versions {
+                      want_version_value: Some(_),
+                    },
+                  ..
+                }) => {
+                  return Err(LazyNpmPackageInfoError::Unexpected("string", i));
+                }
+                Some(Want {
+                  kind:
+                    WantKind::Versions {
+                      want_version_value: None,
+                    },
+                  ..
+                }) => {
+                  let key_name = std::str::from_utf8(&bytes[start..i])?;
+                  want = Some(Want {
+                    kind: WantKind::Versions {
+                      want_version_value: Some(key_name),
+                    },
+                    got_colon: false,
+                  });
+                }
+
+                _ => {}
+              }
+            }
+          }
+        },
+        b'}' => {
+          if let Some(State::InObject(start)) = state.last().copied() {
+            let _ = state.pop();
+            object_level -= 1;
+            if object_level == 0 {
+              break;
+            }
+            if object_level == 1 {
+              if let Some(Want { kind, .. }) = want {
+                match kind {
+                  WantKind::Name => {
+                    return Err(LazyNpmPackageInfoError::Unexpected("}", i));
+                  }
+                  WantKind::DistTags => {
+                    dist_tags = Some(
+                      serde_json::from_slice(&bytes[start..i + 1])
+                        .map_err(Arc::new)?,
+                    );
+                  }
+                  WantKind::Versions { .. } => {
+                    // done
+                  }
+                }
+                want = None;
+              }
+            } else if object_level == 2 {
+              if let Some(Want {
+                kind:
+                  WantKind::Versions {
+                    want_version_value: Some(key),
+                  },
+                got_colon: true,
+              }) = want
+              {
+                let version = Version::parse_from_npm(key)?;
+                let string = std::str::from_utf8(&bytes[start..i + 1])?;
+                versions.insert(version, Box::from(string));
+                want = Some(Want {
+                  kind: WantKind::Versions {
+                    want_version_value: None,
+                  },
+                  got_colon: false,
+                });
+              }
+            }
+          }
+        }
+        b'\"' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u' if escape => {
+          escape = false;
+        }
+        _ => {}
+      }
+      i += 1;
+    }
+
+    Ok(Self {
+      // TODO: no unwrap
+      dist_tags: dist_tags.unwrap(),
+      name: name.unwrap(),
+      versions: Arc::new(RwLock::new(HashMap::with_capacity(32))),
+      unparsed_versions: Arc::new(RwLock::new(versions)),
+    })
+  }
 }
 
 impl NpmPackageInfo {
@@ -370,7 +737,7 @@ pub trait NpmRegistryApi {
   async fn package_info(
     &self,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>;
+  ) -> Result<Arc<LazyNpmPackageInfo>, NpmRegistryPackageInfoLoadError>;
 
   /// Marks that new requests for package information should retrieve it
   /// from the npm registry
@@ -399,7 +766,7 @@ impl TestNpmRegistryApi {
     let previous = self
       .package_infos
       .borrow_mut()
-      .insert(name.to_string(), Arc::new(info));
+      .insert(name.to_string(), Arc::new(info.into()));
     assert!(previous.is_none());
   }
 
@@ -534,13 +901,15 @@ impl NpmRegistryApi for TestNpmRegistryApi {
   async fn package_info(
     &self,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  ) -> Result<Arc<LazyNpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
     let infos = self.package_infos.borrow();
-    Ok(infos.get(name).cloned().ok_or_else(|| {
-      NpmRegistryPackageInfoLoadError::PackageNotExists {
-        package_name: name.into(),
-      }
-    })?)
+    Ok(Arc::new(LazyNpmPackageInfo::from(
+      &**infos.get(name).ok_or_else(|| {
+        NpmRegistryPackageInfoLoadError::PackageNotExists {
+          package_name: name.into(),
+        }
+      })?,
+    )))
   }
 }
 
@@ -887,6 +1256,50 @@ mod test {
   use serde_json;
 
   use super::*;
+
+  #[test]
+  fn lazy() {
+    let text = r#"{ "name": "@deno/test", "dist-tags" : { "latest": "0.5.0", "beta": "0.6.0-beta.1" }, "versions": { "0.5.0": { "version": "0.5.0", "dist": { "tarball": "value", "shasum": "test" } } } }"#;
+    // println!("{}", &text[36..]);
+    let info = LazyNpmPackageInfo::from_json_str(text).unwrap();
+    assert_eq!(info.name, "@deno/test");
+    assert_eq!(
+      info.dist_tags.get("latest").unwrap(),
+      &Version::parse_from_npm("0.5.0").unwrap()
+    );
+
+    let version = info
+      .version_info(&Version::parse_from_npm("0.5.0").unwrap())
+      .unwrap()
+      .version
+      .clone();
+    assert_eq!(version, Version::parse_from_npm("0.5.0").unwrap())
+  }
+
+  #[test]
+  fn lazy_two() {
+    let text = std::fs::read_to_string("registry.json").unwrap();
+    let lazy_info = LazyNpmPackageInfo::from_json_str(&text).unwrap();
+    let info: NpmPackageInfo = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(
+      info.versions.len(),
+      lazy_info.versions().into_iter().count()
+    );
+
+    let mut lazy_versions =
+      lazy_info.versions().into_iter().collect::<Vec<_>>();
+    let mut versions = info.versions.keys().cloned().collect::<Vec<_>>();
+    lazy_versions.sort();
+    versions.sort();
+    assert_eq!(lazy_versions, versions);
+
+    for version in versions {
+      let lazy_version_info = lazy_info.version_info(&version).unwrap();
+      let version_info = info.versions.get(&version).unwrap();
+      assert_eq!(&*lazy_version_info, version_info);
+    }
+  }
 
   #[test]
   fn deserializes_minimal_pkg_info() {

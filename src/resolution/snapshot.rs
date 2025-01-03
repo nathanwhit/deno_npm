@@ -26,6 +26,8 @@ use super::graph::GraphDependencyResolver;
 use super::graph::NpmResolutionError;
 use super::NpmPackageVersionNotFound;
 
+use crate::registry::LazyNpmPackageInfo;
+use crate::registry::LazyNpmPackageInfoError;
 use crate::registry::NpmPackageInfo;
 use crate::registry::NpmPackageVersionBinEntry;
 use crate::registry::NpmPackageVersionDistInfo;
@@ -291,7 +293,9 @@ impl NpmResolutionSnapshot {
     options: AddPkgReqsOptions<'_>,
   ) -> AddPkgReqsResult {
     enum InfoOrNv {
-      InfoResult(Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>),
+      InfoResult(
+        Result<Arc<LazyNpmPackageInfo>, NpmRegistryPackageInfoLoadError>,
+      ),
       Nv(PackageNv),
     }
     // convert the snapshot to a traversable graph
@@ -908,10 +912,10 @@ pub struct IntegrityCheckFailedError {
 pub enum SnapshotFromLockfileError {
   #[error(transparent)]
   PackageInfoLoad(#[from] NpmRegistryPackageInfoLoadError),
-  #[error("Could not find '{}' specified in the lockfile.", .source.0)]
+  #[error("Could not find '{}' specified in the lockfile.", .source)]
   VersionNotFound {
     #[from]
-    source: NpmPackageVersionNotFound,
+    source: LazyNpmPackageInfoError,
   },
   #[error("The lockfile is corrupt. Remove the lockfile to regenerate it.")]
   PackageIdNotFound(#[from] PackageIdNotFoundError),
@@ -961,7 +965,7 @@ pub async fn snapshot_from_lockfile<'a>(
       .map_err(|e: &SnapshotFromLockfileError| e.clone())
       .and_then(|(package_info, nv)| {
         package_info
-          .version_info(nv)
+          .version_info(&nv.version)
           .map_err(|e| SnapshotFromLockfileError::VersionNotFound { source: e })
       });
     match result {

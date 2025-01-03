@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use deno_npm::registry::LazyNpmPackageInfo;
 use deno_npm::registry::NpmPackageInfo;
 use deno_npm::registry::NpmRegistryApi;
 use deno_npm::registry::NpmRegistryPackageInfoLoadError;
@@ -110,7 +111,7 @@ mod resolution {
 }
 
 struct RealBenchRegistryApi {
-  data: Rc<RefCell<HashMap<String, Arc<NpmPackageInfo>>>>,
+  data: Rc<RefCell<HashMap<String, Arc<LazyNpmPackageInfo>>>>,
 }
 
 impl Default for RealBenchRegistryApi {
@@ -127,13 +128,14 @@ impl NpmRegistryApi for RealBenchRegistryApi {
   async fn package_info(
     &self,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  ) -> Result<Arc<LazyNpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
     if let Some(data) = self.data.borrow_mut().get(name).cloned() {
       return Ok(data);
     }
     let file_path = packument_cache_filepath(name);
     if let Ok(data) = std::fs::read_to_string(&file_path) {
-      if let Ok(data) = serde_json::from_str::<Arc<NpmPackageInfo>>(&data) {
+      if let Ok(data) = LazyNpmPackageInfo::from_json_str(&data) {
+        let data = Arc::new(data);
         self
           .data
           .borrow_mut()
@@ -151,7 +153,7 @@ impl NpmRegistryApi for RealBenchRegistryApi {
     }
     let text = resp.text().await.unwrap();
     std::fs::write(&file_path, &text).unwrap();
-    let data = serde_json::from_str::<Arc<NpmPackageInfo>>(&text).unwrap();
+    let data = Arc::new(LazyNpmPackageInfo::from_json_str(&text).unwrap());
     self
       .data
       .borrow_mut()

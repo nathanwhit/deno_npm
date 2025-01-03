@@ -216,6 +216,7 @@ dependencies = [
  "futures",
  "log",
  "monch",
+ "parking_lot",
  "pretty_assertions",
  "reqwest",
  "serde",

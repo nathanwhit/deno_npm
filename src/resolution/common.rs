@@ -1,5 +1,7 @@
 // Copyright 2018-2024 the Deno authors. MIT license.
 
+use std::ops::Deref;
+
 use deno_semver::package::PackageNv;
 use deno_semver::StackString;
 use deno_semver::Version;
@@ -7,8 +9,10 @@ use deno_semver::VersionReq;
 use deno_semver::WILDCARD_VERSION_REQ;
 use thiserror::Error;
 
+use crate::registry::LazyNpmPackageInfo;
 use crate::registry::NpmPackageInfo;
 use crate::registry::NpmPackageVersionInfo;
+use crate::registry::NpmPackageVersionInfoRef;
 
 /// Error that occurs when the version is not found in the package information.
 #[derive(Debug, Error, Clone, deno_error::JsError)]
@@ -46,6 +50,9 @@ pub enum NpmPackageVersionResolutionError {
     package_name: StackString,
     version_req: VersionReq,
   },
+  #[class(type)]
+  #[error(transparent)]
+  LazyNpmPackageInfo(#[from] crate::registry::LazyNpmPackageInfoError),
 }
 
 #[derive(Debug, Clone)]
@@ -57,24 +64,16 @@ impl NpmVersionResolver {
   pub fn resolve_best_package_version_info<'info, 'version>(
     &self,
     version_req: &VersionReq,
-    package_info: &'info NpmPackageInfo,
+    package_info: &'info LazyNpmPackageInfo,
     existing_versions: impl Iterator<Item = &'version Version>,
-  ) -> Result<&'info NpmPackageVersionInfo, NpmPackageVersionResolutionError>
+  ) -> Result<NpmPackageVersionInfoRef<'info>, NpmPackageVersionResolutionError>
   {
     if let Some(version) = self.resolve_best_from_existing_versions(
       version_req,
       package_info,
       existing_versions,
     )? {
-      match package_info.versions.get(version) {
-        Some(version_info) => Ok(version_info),
-        None => Err(NpmPackageVersionResolutionError::VersionNotFound(
-          NpmPackageVersionNotFound(PackageNv {
-            name: package_info.name.clone(),
-            version: version.clone(),
-          }),
-        )),
-      }
+      Ok(package_info.version_info(version).unwrap())
     } else {
       // get the information
       self.get_resolved_package_version_and_info(version_req, package_info)
@@ -84,8 +83,9 @@ impl NpmVersionResolver {
   fn get_resolved_package_version_and_info<'a>(
     &self,
     version_req: &VersionReq,
-    info: &'a NpmPackageInfo,
-  ) -> Result<&'a NpmPackageVersionInfo, NpmPackageVersionResolutionError> {
+    info: &'a LazyNpmPackageInfo,
+  ) -> Result<NpmPackageVersionInfoRef<'a>, NpmPackageVersionResolutionError>
+  {
     if let Some(tag) = version_req.tag() {
       self.tag_to_version_info(info, tag)
       // When the version is *, if there is a latest tag, use it directly.
@@ -105,22 +105,21 @@ impl NpmVersionResolver {
     {
       self.tag_to_version_info(info, "latest")
     } else {
-      let mut maybe_best_version: Option<&'a NpmPackageVersionInfo> = None;
-      for version_info in info.versions.values() {
-        let version = &version_info.version;
-        if self.version_req_satisfies(version_req, version, info)? {
+      let mut maybe_best_version: Option<Version> = None;
+      for version in info.versions() {
+        if self.version_req_satisfies(version_req, &version, info)? {
           let is_best_version = maybe_best_version
             .as_ref()
-            .map(|best_version| best_version.version.cmp(version).is_lt())
+            .map(|best_version| best_version.cmp(&version).is_lt())
             .unwrap_or(true);
           if is_best_version {
-            maybe_best_version = Some(version_info);
+            maybe_best_version = Some(version);
           }
         }
       }
 
       match maybe_best_version {
-        Some(v) => Ok(v),
+        Some(v) => Ok(info.version_info(&v)?),
         // Although it seems like we could make this smart by fetching the latest
         // information for this package here, we really need a full restart. There
         // could be very interesting bugs that occur if this package's version was
@@ -140,7 +139,7 @@ impl NpmVersionResolver {
     &self,
     version_req: &VersionReq,
     version: &Version,
-    package_info: &NpmPackageInfo,
+    package_info: &LazyNpmPackageInfo,
   ) -> Result<bool, NpmPackageVersionResolutionError> {
     match version_req.tag() {
       Some(tag) => {
@@ -171,7 +170,7 @@ impl NpmVersionResolver {
   fn resolve_best_from_existing_versions<'a>(
     &self,
     version_req: &VersionReq,
-    package_info: &NpmPackageInfo,
+    package_info: &LazyNpmPackageInfo,
     existing_versions: impl Iterator<Item = &'a Version>,
   ) -> Result<Option<&'a Version>, NpmPackageVersionResolutionError> {
     let mut maybe_best_version: Option<&Version> = None;
@@ -191,17 +190,20 @@ impl NpmVersionResolver {
 
   fn tag_to_version_info<'a>(
     &self,
-    info: &'a NpmPackageInfo,
+    info: &'a LazyNpmPackageInfo,
     tag: &str,
-  ) -> Result<&'a NpmPackageVersionInfo, NpmPackageVersionResolutionError> {
+  ) -> Result<NpmPackageVersionInfoRef<'a>, NpmPackageVersionResolutionError>
+  {
     if let Some(version) = info.dist_tags.get(tag) {
-      match info.versions.get(version) {
-        Some(info) => Ok(info),
-        None => Err(NpmPackageVersionResolutionError::DistTagVersionNotFound {
-          package_name: info.name.clone(),
-          dist_tag: tag.to_string(),
-          version: version.to_string(),
-        }),
+      match info.version_info(version) {
+        Ok(info) => Ok(info),
+        Err(_) => {
+          Err(NpmPackageVersionResolutionError::DistTagVersionNotFound {
+            package_name: info.name.clone(),
+            dist_tag: tag.to_string(),
+            version: version.to_string(),
+          })
+        }
       }
     } else {
       Err(NpmPackageVersionResolutionError::DistTagNotFound {
@@ -231,7 +233,8 @@ mod test {
         "latest".into(),
         Version::parse_from_npm("1.0.0-alpha").unwrap(),
       )]),
-    };
+    }
+    .into();
     let resolver = NpmVersionResolver {
       types_node_version_req: None,
     };
@@ -265,7 +268,8 @@ mod test {
         "latest".into(),
         Version::parse_from_npm("1.0.0-alpha").unwrap(),
       )]),
-    };
+    }
+    .into();
     let result = resolver.get_resolved_package_version_and_info(
       &package_req.version_req,
       &package_info,
@@ -300,7 +304,8 @@ mod test {
         "latest".into(),
         Version::parse_from_npm("1.1.0").unwrap(),
       )]),
-    };
+    }
+    .into();
     let resolver = NpmVersionResolver {
       types_node_version_req: Some(
         VersionReq::parse_from_npm("1.0.0").unwrap(),
@@ -338,7 +343,8 @@ mod test {
         "latest".into(),
         Version::parse_from_npm("1.0.0-rc.1").unwrap(),
       )]),
-    };
+    }
+    .into();
     let resolver = NpmVersionResolver {
       types_node_version_req: None,
     };
@@ -394,6 +400,7 @@ mod test {
         ),
       ]),
     };
+    let package_info = package_info.into();
     let resolver = NpmVersionResolver {
       types_node_version_req: None,
     };
