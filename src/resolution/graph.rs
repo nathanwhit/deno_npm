@@ -907,7 +907,6 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         .or_default()
         .iter(),
     )?;
-    let info = info.clone();
     let resolved_id = ResolvedId {
       nv: Rc::new(PackageNv {
         name: package_info.name.clone(),
@@ -970,8 +969,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           let package_info = self.api.package_info(&pkg_nv.name).await?;
           let version_info = package_info
             .version_info(&pkg_nv.version)
-            .map_err(NpmPackageVersionResolutionError::LazyNpmPackageInfo)?
-            .clone();
+            .map_err(NpmPackageVersionResolutionError::LazyNpmPackageInfo)?;
           self.dep_entry_cache.store(pkg_nv.clone(), &version_info)?
         };
 

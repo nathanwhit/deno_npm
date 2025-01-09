@@ -105,7 +105,7 @@ impl NpmVersionResolver {
     {
       self.tag_to_version_info(info, "latest")
     } else {
-      let mut maybe_best_version: Option<Version> = None;
+      let mut maybe_best_version: Option<&Version> = None;
       for version in info.versions() {
         if self.version_req_satisfies(version_req, &version, info)? {
           let is_best_version = maybe_best_version

@@ -48,12 +48,13 @@ impl<'a> LazyVersionInfo<'a> {
   }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LazyNpmPackageInfo {
   pub name: StackString,
   pub dist_tags: HashMap<String, Version>,
-  versions: Arc<RwLock<HashMap<Version, NpmPackageVersionInfo>>>,
-  unparsed_versions: Arc<RwLock<HashMap<Version, Box<str>>>>,
+  versions: Vec<Version>,
+  parsed_versions: RwLock<HashMap<Version, NpmPackageVersionInfo>>,
+  unparsed_versions: RwLock<HashMap<Version, Box<str>>>,
 }
 
 impl From<NpmPackageInfo> for LazyNpmPackageInfo {
@@ -61,8 +62,9 @@ impl From<NpmPackageInfo> for LazyNpmPackageInfo {
     Self {
       name: value.name.into(),
       dist_tags: value.dist_tags,
-      versions: Arc::new(RwLock::new(value.versions)),
-      unparsed_versions: Arc::new(RwLock::new(HashMap::new())),
+      versions: value.versions.keys().cloned().collect(),
+      parsed_versions: RwLock::new(value.versions),
+      unparsed_versions: RwLock::new(HashMap::new()),
     }
   }
 }
@@ -71,8 +73,9 @@ impl From<&NpmPackageInfo> for LazyNpmPackageInfo {
     Self {
       name: value.name.clone().into(),
       dist_tags: value.dist_tags.clone(),
-      versions: Arc::new(RwLock::new(value.versions.clone())),
-      unparsed_versions: Arc::new(RwLock::new(HashMap::new())),
+      versions: value.versions.keys().cloned().collect(),
+      parsed_versions: RwLock::new(value.versions.clone()),
+      unparsed_versions: RwLock::new(HashMap::new()),
     }
   }
 }
@@ -92,8 +95,9 @@ impl Deref for NpmPackageVersionInfoRef<'_> {
 impl LazyNpmPackageInfo {
   #[cfg(test)]
   pub fn to_eager(&self) -> NpmPackageInfo {
-    let mut versions = HashMap::with_capacity(self.versions.read().len());
-    for (version, info) in self.versions.read().iter() {
+    let mut versions =
+      HashMap::with_capacity(self.parsed_versions.read().len());
+    for (version, info) in self.parsed_versions.read().iter() {
       versions.insert(version.clone(), info.clone());
     }
     for (version, string) in self.unparsed_versions.read().iter() {
@@ -110,7 +114,7 @@ impl LazyNpmPackageInfo {
     &self,
     version: &Version,
   ) -> Result<NpmPackageVersionInfoRef<'_>, LazyNpmPackageInfoError> {
-    let should_insert = if self.versions.read().get(&version).is_some() {
+    let should_insert = if self.parsed_versions.read().get(&version).is_some() {
       false
     } else {
       true
@@ -130,23 +134,17 @@ impl LazyNpmPackageInfo {
           })?;
       let info: NpmPackageVersionInfo =
         serde_json::from_str(&string).map_err(Arc::new)?;
-      self.versions.write().insert(version.clone(), info);
+      self.parsed_versions.write().insert(version.clone(), info);
     }
 
     Ok(NpmPackageVersionInfoRef(parking_lot::RwLockReadGuard::map(
-      self.versions.read(),
+      self.parsed_versions.read(),
       |v| v.get(version).unwrap(),
     )))
   }
 
-  pub fn versions(&self) -> impl IntoIterator<Item = Version> {
-    self
-      .versions
-      .read()
-      .keys()
-      .cloned()
-      .chain(self.unparsed_versions.read().keys().cloned())
-      .collect::<Vec<_>>()
+  pub fn versions(&self) -> impl IntoIterator<Item = &Version> {
+    self.versions.iter()
   }
 }
 
@@ -392,8 +390,9 @@ impl LazyNpmPackageInfo {
       // TODO: no unwrap
       dist_tags: dist_tags.unwrap(),
       name: name.unwrap(),
-      versions: Arc::new(RwLock::new(HashMap::with_capacity(32))),
-      unparsed_versions: Arc::new(RwLock::new(versions)),
+      versions: versions.keys().cloned().collect(),
+      parsed_versions: RwLock::new(HashMap::with_capacity(32)),
+      unparsed_versions: RwLock::new(versions),
     })
   }
 }
@@ -1289,7 +1288,7 @@ mod test {
 
     let mut lazy_versions =
       lazy_info.versions().into_iter().collect::<Vec<_>>();
-    let mut versions = info.versions.keys().cloned().collect::<Vec<_>>();
+    let mut versions = info.versions.keys().collect::<Vec<_>>();
     lazy_versions.sort();
     versions.sort();
     assert_eq!(lazy_versions, versions);
