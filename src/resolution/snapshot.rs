@@ -1,5 +1,6 @@
 // Copyright 2018-2024 the Deno authors. MIT license.
 
+use bumpalo::Bump;
 use deno_error::JsError;
 use deno_lockfile::Lockfile;
 use deno_semver::package::PackageNv;
@@ -290,21 +291,22 @@ impl NpmResolutionSnapshot {
     api: &impl NpmRegistryApi,
     options: AddPkgReqsOptions<'_>,
   ) -> AddPkgReqsResult {
+    let arena = &Bump::new();
     enum InfoOrNv {
       InfoResult(Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>),
       Nv(PackageNv),
     }
     // convert the snapshot to a traversable graph
-    let mut graph = Graph::from_snapshot(self);
+    let mut graph = Graph::from_snapshot(arena, self);
 
     let reqs_with_in_graph = options
       .package_reqs
       .iter()
-      .map(|req| (req, graph.get_req_nv(req).map(|r| r.as_ref().clone())));
+      .map(|req| (req, graph.get_req_nv(req).map(|r| r)));
     let mut top_level_packages = FuturesOrdered::from_iter({
       reqs_with_in_graph.map(|(req, maybe_nv)| async move {
         let maybe_info = if let Some(nv) = maybe_nv {
-          InfoOrNv::Nv(nv)
+          InfoOrNv::Nv(nv.clone())
         } else {
           InfoOrNv::InfoResult(api.package_info(&req.name).await)
         };
@@ -333,7 +335,7 @@ impl NpmResolutionSnapshot {
             .and_then(|info| resolver.add_package_req(req, &info))
           {
             Ok(nv) => {
-              results.push(Ok(nv.as_ref().clone()));
+              results.push(Ok(nv.clone()));
             }
             Err(err) => {
               if first_resolution_error.is_none() {

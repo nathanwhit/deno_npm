@@ -1,5 +1,7 @@
 // Copyright 2018-2024 the Deno authors. MIT license.
 
+use bumpalo::collections::CollectIn;
+use bumpalo::Bump;
 use deno_semver::package::PackageName;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
@@ -35,6 +37,10 @@ use super::common::NpmVersionResolver;
 use super::snapshot::NpmResolutionSnapshot;
 use crate::NpmPackageId;
 use crate::NpmResolutionPackage;
+
+type BumpVec<'b, T> = bumpalo::collections::Vec<'b, T>;
+type BumpHashMap<'b, K, V> =
+  hashbrown::HashMap<K, V, hashbrown::DefaultHashBuilder, &'b bumpalo::Bump>;
 
 // todo(dsherret): for perf we should use an arena/bump allocator for
 // creating the nodes and paths since this is done in a phase
@@ -75,19 +81,19 @@ struct Node {
 }
 
 #[derive(Clone)]
-enum ResolvedIdPeerDep {
+enum ResolvedIdPeerDep<'b> {
   /// This is a reference to the parent instead of the child because we only have a
   /// node reference to the parent, since we've traversed it, but the child node may
   /// change from under it.
   ParentReference {
-    parent: GraphPathNodeOrRoot,
-    child_pkg_nv: Rc<PackageNv>,
+    parent: GraphPathNodeOrRoot<'b>,
+    child_pkg_nv: PackageNvRef<'b>,
   },
   /// A node that was created during snapshotting and is not being used in any path.
   SnapshotNodeId(NodeId),
 }
 
-impl ResolvedIdPeerDep {
+impl<'b> ResolvedIdPeerDep<'b> {
   pub fn current_state_hash(&self) -> u64 {
     let mut hasher = DefaultHasher::new();
     self.current_state_hash_with_hasher(&mut hasher);
@@ -116,12 +122,12 @@ impl ResolvedIdPeerDep {
 /// A pending resolved identifier used in the graph. At the end of resolution, these
 /// will become fully resolved to an `NpmPackageId`.
 #[derive(Clone)]
-struct ResolvedId {
-  nv: Rc<PackageNv>,
-  peer_dependencies: Vec<ResolvedIdPeerDep>,
+struct ResolvedId<'b> {
+  nv: PackageNvRef<'b>,
+  peer_dependencies: BumpVec<'b, ResolvedIdPeerDep<'b>>,
 }
 
-impl ResolvedId {
+impl<'b> ResolvedId<'b> {
   /// Gets a hash of the resolved identifier at this current moment in time.
   ///
   /// WARNING: A resolved identifier references a value that could change in
@@ -135,7 +141,7 @@ impl ResolvedId {
     hasher.finish()
   }
 
-  pub fn push_peer_dep(&mut self, peer_dep: ResolvedIdPeerDep) -> bool {
+  pub fn push_peer_dep(&mut self, peer_dep: ResolvedIdPeerDep<'b>) -> bool {
     let new_hash = peer_dep.current_state_hash();
     for dep in &self.peer_dependencies {
       if new_hash == dep.current_state_hash() {
@@ -152,14 +158,20 @@ impl ResolvedId {
 ///
 /// The mapping from resolved to node_ids is imprecise and will do a best attempt
 /// at sharing nodes.
-#[derive(Default)]
-struct ResolvedNodeIds {
-  node_to_resolved_id: HashMap<NodeId, (ResolvedId, u64)>,
-  resolved_to_node_id: HashMap<u64, NodeId>,
+// #[derive(Default)]
+struct ResolvedNodeIds<'b> {
+  node_to_resolved_id: BumpHashMap<'b, NodeId, (ResolvedId<'b>, u64)>,
+  resolved_to_node_id: BumpHashMap<'b, u64, NodeId>,
 }
 
-impl ResolvedNodeIds {
-  pub fn set(&mut self, node_id: NodeId, resolved_id: ResolvedId) {
+impl<'b> ResolvedNodeIds<'b> {
+  pub fn new_in(arena: &'b Bump) -> Self {
+    Self {
+      node_to_resolved_id: BumpHashMap::new_in(arena),
+      resolved_to_node_id: BumpHashMap::new_in(arena),
+    }
+  }
+  pub fn set(&mut self, node_id: NodeId, resolved_id: ResolvedId<'b>) {
     let resolved_id_hash = resolved_id.current_state_hash();
     if let Some((_, old_resolved_id_key)) = self
       .node_to_resolved_id
@@ -171,11 +183,11 @@ impl ResolvedNodeIds {
     self.resolved_to_node_id.insert(resolved_id_hash, node_id);
   }
 
-  pub fn get(&self, node_id: NodeId) -> Option<&ResolvedId> {
+  pub fn get(&self, node_id: NodeId) -> Option<&ResolvedId<'b>> {
     self.node_to_resolved_id.get(&node_id).map(|(id, _)| id)
   }
 
-  pub fn get_node_id(&self, resolved_id: &ResolvedId) -> Option<NodeId> {
+  pub fn get_node_id(&self, resolved_id: &ResolvedId<'b>) -> Option<NodeId> {
     self
       .resolved_to_node_id
       .get(&resolved_id.current_state_hash())
@@ -203,36 +215,44 @@ impl NodeIdRef {
 }
 
 #[derive(Clone)]
-enum GraphPathNodeOrRoot {
-  Node(Rc<GraphPath>),
-  Root(Rc<PackageNv>),
+enum GraphPathNodeOrRoot<'b> {
+  Node(GraphPathRef<'b>),
+  Root(PackageNvRef<'b>),
 }
+
+type GraphPathRef<'b> = &'b GraphPath<'b>;
+
+type PackageNvRef<'b> = &'b PackageNv;
 
 /// Path through the graph that represents a traversal through the graph doing
 /// the dependency resolution. The graph tries to share duplicate package
 /// information and we try to avoid traversing parts of the graph that we know
 /// are resolved.
-struct GraphPath {
-  previous_node: Option<GraphPathNodeOrRoot>,
+struct GraphPath<'b> {
+  previous_node: Option<GraphPathNodeOrRoot<'b>>,
   node_id_ref: NodeIdRef,
   specifier: StackString,
   // we could consider not storing this here and instead reference the resolved
   // nodes, but we should performance profile this code first
-  nv: Rc<PackageNv>,
+  nv: PackageNvRef<'b>,
   /// Descendants in the path that circularly link to an ancestor in a child. These
   /// descendants should be kept up to date and always point to this node.
-  linked_circular_descendants: RefCell<Vec<Rc<GraphPath>>>,
+  linked_circular_descendants: RefCell<BumpVec<'b, GraphPathRef<'b>>>,
 }
 
-impl GraphPath {
-  pub fn for_root(node_id: NodeId, nv: Rc<PackageNv>) -> Rc<Self> {
-    Rc::new(Self {
-      previous_node: Some(GraphPathNodeOrRoot::Root(nv.clone())),
+impl<'b> GraphPath<'b> {
+  pub fn for_root(
+    arena: &'b Bump,
+    node_id: NodeId,
+    nv: PackageNvRef<'b>,
+  ) -> GraphPathRef<'b> {
+    arena.alloc(Self {
+      previous_node: Some(GraphPathNodeOrRoot::Root(nv)),
       node_id_ref: NodeIdRef::new(node_id),
       // use an empty specifier
       specifier: "".into(),
       nv,
-      linked_circular_descendants: Default::default(),
+      linked_circular_descendants: RefCell::new(BumpVec::new_in(arena)),
     })
   }
 
@@ -249,27 +269,28 @@ impl GraphPath {
   }
 
   pub fn with_id(
-    self: &Rc<GraphPath>,
+    &'b self,
+    arena: &'b Bump,
     node_id: NodeId,
     specifier: StackString,
-    nv: Rc<PackageNv>,
-  ) -> Rc<Self> {
-    Rc::new(Self {
-      previous_node: Some(GraphPathNodeOrRoot::Node(self.clone())),
+    nv: PackageNvRef<'b>,
+  ) -> GraphPathRef<'b> {
+    arena.alloc(Self {
+      previous_node: Some(GraphPathNodeOrRoot::Node(self)),
       node_id_ref: NodeIdRef::new(node_id),
       specifier,
       nv,
-      linked_circular_descendants: Default::default(),
+      linked_circular_descendants: RefCell::new(BumpVec::new_in(arena)),
     })
   }
 
   /// Gets if there is an ancestor with the same name & version along this path.
-  pub fn find_ancestor(&self, nv: &PackageNv) -> Option<Rc<GraphPath>> {
+  pub fn find_ancestor(&self, nv: &PackageNv) -> Option<GraphPathRef<'b>> {
     let mut maybe_next_node = self.previous_node.as_ref();
     while let Some(GraphPathNodeOrRoot::Node(next_node)) = maybe_next_node {
       // we've visited this before, so stop
       if *next_node.nv == *nv {
-        return Some(next_node.clone());
+        return Some(*next_node);
       }
       maybe_next_node = next_node.previous_node.as_ref();
     }
@@ -279,34 +300,35 @@ impl GraphPath {
   /// Gets the bottom-up path to the ancestor not including the current or ancestor node.
   pub fn get_path_to_ancestor_exclusive(
     &self,
+    arena: &'b Bump,
     ancestor_node_id: NodeId,
-  ) -> Vec<&Rc<GraphPath>> {
-    let mut path = Vec::new();
+  ) -> BumpVec<GraphPathRef<'b>> {
+    let mut path = BumpVec::new_in(arena);
     let mut maybe_next_node = self.previous_node.as_ref();
     while let Some(GraphPathNodeOrRoot::Node(next_node)) = maybe_next_node {
       if next_node.node_id() == ancestor_node_id {
         break;
       }
-      path.push(next_node);
+      path.push(*next_node);
       maybe_next_node = next_node.previous_node.as_ref();
     }
     debug_assert!(maybe_next_node.is_some());
     path
   }
 
-  pub fn ancestors(&self) -> GraphPathAncestorIterator {
+  pub fn ancestors(&self) -> GraphPathAncestorIterator<'_, 'b> {
     GraphPathAncestorIterator {
       next: self.previous_node.as_ref(),
     }
   }
 }
 
-struct GraphPathAncestorIterator<'a> {
-  next: Option<&'a GraphPathNodeOrRoot>,
+struct GraphPathAncestorIterator<'a, 'b> {
+  next: Option<&'a GraphPathNodeOrRoot<'b>>,
 }
 
-impl<'a> Iterator for GraphPathAncestorIterator<'a> {
-  type Item = &'a GraphPathNodeOrRoot;
+impl<'a, 'b> Iterator for GraphPathAncestorIterator<'a, 'b> {
+  type Item = &'a GraphPathNodeOrRoot<'b>;
   fn next(&mut self) -> Option<Self::Item> {
     if let Some(next) = self.next.take() {
       if let GraphPathNodeOrRoot::Node(node) = next {
@@ -319,23 +341,27 @@ impl<'a> Iterator for GraphPathAncestorIterator<'a> {
   }
 }
 
-pub struct Graph {
+pub struct Graph<'b> {
+  arena: &'b Bump,
   /// Each requirement is mapped to a specific name and version.
-  package_reqs: HashMap<PackageReq, Rc<PackageNv>>,
+  package_reqs: HashMap<PackageReq, PackageNvRef<'b>>,
   /// Then each name and version is mapped to an exact node id.
   /// Note: Uses a BTreeMap in order to create some determinism
   /// when creating the snapshot.
-  root_packages: BTreeMap<Rc<PackageNv>, NodeId>,
+  root_packages: BTreeMap<PackageNvRef<'b>, NodeId>,
   package_name_versions: HashMap<StackString, HashSet<Version>>,
-  nodes: HashMap<NodeId, Node>,
-  resolved_node_ids: ResolvedNodeIds,
+  nodes: BumpHashMap<'b, NodeId, Node>,
+  resolved_node_ids: ResolvedNodeIds<'b>,
   // This will be set when creating from a snapshot, then
   // inform the final snapshot creation.
   packages_to_copy_index: HashMap<NpmPackageId, u8>,
 }
 
-impl Graph {
-  pub fn from_snapshot(snapshot: NpmResolutionSnapshot) -> Self {
+impl<'b> Graph<'b> {
+  pub fn from_snapshot(
+    arena: &'b Bump,
+    snapshot: NpmResolutionSnapshot,
+  ) -> Self {
     fn get_or_create_graph_node<'a>(
       graph: &mut Graph,
       pkg_id: &NpmPackageId,
@@ -351,6 +377,7 @@ impl Graph {
       created_package_ids.insert(pkg_id.clone(), node_id);
       let ancestor_ids_with_current = ancestor_ids.push(pkg_id);
 
+      let arena = graph.arena;
       let peer_dep_ids = pkg_id
         .peer_dependencies
         .iter()
@@ -363,9 +390,9 @@ impl Graph {
             &ancestor_ids_with_current,
           ))
         })
-        .collect::<Vec<_>>();
+        .collect_in::<BumpVec<_>>(arena);
       let graph_resolved_id = ResolvedId {
-        nv: Rc::new(pkg_id.nv.clone()),
+        nv: arena.alloc(pkg_id.nv.clone()),
         peer_dependencies: peer_dep_ids,
       };
       graph.resolved_node_ids.set(node_id, graph_resolved_id);
@@ -420,6 +447,7 @@ impl Graph {
     }
 
     let mut graph = Self {
+      arena,
       // Note: It might be more correct to store the copy index
       // from past resolutions with the node somehow, but maybe not.
       packages_to_copy_index: snapshot
@@ -430,11 +458,11 @@ impl Graph {
       package_reqs: snapshot
         .package_reqs
         .into_iter()
-        .map(|(k, v)| (k, Rc::new(v)))
+        .map(|(k, v)| (k, &*arena.alloc(v)))
         .collect(),
-      nodes: Default::default(),
+      nodes: BumpHashMap::new_in(arena),
       package_name_versions: Default::default(),
-      resolved_node_ids: Default::default(),
+      resolved_node_ids: ResolvedNodeIds::new_in(arena),
       root_packages: Default::default(),
     };
     let mut created_package_ids =
@@ -447,13 +475,13 @@ impl Graph {
         &mut created_package_ids,
         &Default::default(),
       );
-      graph.root_packages.insert(Rc::new(id), node_id);
+      graph.root_packages.insert(arena.alloc(id), node_id);
     }
     graph
   }
 
-  pub fn get_req_nv(&self, req: &PackageReq) -> Option<&Rc<PackageNv>> {
-    self.package_reqs.get(req)
+  pub fn get_req_nv(&self, req: &PackageReq) -> Option<PackageNvRef<'b>> {
+    self.package_reqs.get(req).map(|&r| r)
   }
 
   fn get_npm_pkg_id(&self, node_id: NodeId) -> NpmPackageId {
@@ -463,7 +491,7 @@ impl Graph {
 
   fn get_npm_pkg_id_from_resolved_id(
     &self,
-    resolved_id: &ResolvedId,
+    resolved_id: &ResolvedId<'b>,
     seen: HashSet<NodeId>,
   ) -> NpmPackageId {
     if resolved_id.peer_dependencies.is_empty() {
@@ -511,8 +539,8 @@ impl Graph {
 
   fn peer_dep_to_maybe_node_id_and_resolved_id(
     &self,
-    peer_dep: &ResolvedIdPeerDep,
-  ) -> Option<(NodeId, &ResolvedId)> {
+    peer_dep: &ResolvedIdPeerDep<'b>,
+  ) -> Option<(NodeId, &ResolvedId<'b>)> {
     match peer_dep {
       ResolvedIdPeerDep::SnapshotNodeId(node_id) => self
         .resolved_node_ids
@@ -551,7 +579,7 @@ impl Graph {
 
   fn get_or_create_for_id(
     &mut self,
-    resolved_id: &ResolvedId,
+    resolved_id: &ResolvedId<'b>,
   ) -> (bool, NodeId) {
     if let Some(node_id) = self.resolved_node_ids.get_node_id(resolved_id) {
       return (false, node_id);
@@ -708,7 +736,7 @@ impl Graph {
 
   #[cfg(debug_assertions)]
   #[allow(unused, clippy::print_stderr)]
-  fn output_path(&self, path: &Rc<GraphPath>) {
+  fn output_path(&self, path: GraphPathRef<'b>) {
     eprintln!("-----------");
     self.output_node(path.node_id(), false);
     for path in path.ancestors() {
@@ -767,12 +795,14 @@ impl Graph {
 }
 
 #[derive(Default)]
-struct DepEntryCache(HashMap<Rc<PackageNv>, Rc<Vec<NpmDependencyEntry>>>);
+struct DepEntryCache<'b>(
+  HashMap<PackageNvRef<'b>, Rc<Vec<NpmDependencyEntry>>>,
+);
 
-impl DepEntryCache {
+impl<'b> DepEntryCache<'b> {
   pub fn store(
     &mut self,
-    nv: Rc<PackageNv>,
+    nv: PackageNvRef<'b>,
     version_info: &NpmPackageVersionInfo,
   ) -> Result<Rc<Vec<NpmDependencyEntry>>, Box<NpmDependencyEntryError>> {
     debug_assert_eq!(nv.version, version_info.version);
@@ -791,26 +821,26 @@ impl DepEntryCache {
   }
 }
 
-struct UnresolvedOptionalPeer {
+struct UnresolvedOptionalPeer<'b> {
   specifier: StackString,
-  graph_path: Rc<GraphPath>,
+  graph_path: GraphPathRef<'b>,
 }
 
-pub struct GraphDependencyResolver<'a, TNpmRegistryApi: NpmRegistryApi> {
-  graph: &'a mut Graph,
+pub struct GraphDependencyResolver<'a, 'b, TNpmRegistryApi: NpmRegistryApi> {
+  graph: &'a mut Graph<'b>,
   api: &'a TNpmRegistryApi,
   version_resolver: &'a NpmVersionResolver,
-  pending_unresolved_nodes: VecDeque<Rc<GraphPath>>,
+  pending_unresolved_nodes: VecDeque<GraphPathRef<'b>>,
   unresolved_optional_peers:
-    HashMap<Rc<PackageNv>, Vec<UnresolvedOptionalPeer>>,
-  dep_entry_cache: DepEntryCache,
+    HashMap<PackageNvRef<'b>, Vec<UnresolvedOptionalPeer<'b>>>,
+  dep_entry_cache: DepEntryCache<'b>,
 }
 
-impl<'a, TNpmRegistryApi: NpmRegistryApi>
-  GraphDependencyResolver<'a, TNpmRegistryApi>
+impl<'a, 'b, TNpmRegistryApi: NpmRegistryApi>
+  GraphDependencyResolver<'a, 'b, TNpmRegistryApi>
 {
   pub fn new(
-    graph: &'a mut Graph,
+    graph: &'a mut Graph<'b>,
     api: &'a TNpmRegistryApi,
     version_resolver: &'a NpmVersionResolver,
   ) -> Self {
@@ -828,9 +858,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &mut self,
     package_req: &PackageReq,
     package_info: &NpmPackageInfo,
-  ) -> Result<Rc<PackageNv>, NpmResolutionError> {
+  ) -> Result<PackageNvRef<'b>, NpmResolutionError> {
+    let arena = self.graph.arena;
+
     if let Some(nv) = self.graph.get_req_nv(package_req) {
-      return Ok(nv.clone()); // already added
+      return Ok(nv); // already added
     }
 
     let (pkg_nv, node_id) = self.resolve_node_from_info(
@@ -839,14 +871,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       package_info,
       None,
     )?;
-    self
-      .graph
-      .package_reqs
-      .insert(package_req.clone(), pkg_nv.clone());
-    self.graph.root_packages.insert(pkg_nv.clone(), node_id);
+    self.graph.package_reqs.insert(package_req.clone(), pkg_nv);
+    self.graph.root_packages.insert(pkg_nv, node_id);
     self
       .pending_unresolved_nodes
-      .push_back(GraphPath::for_root(node_id, pkg_nv.clone()));
+      .push_back(GraphPath::for_root(arena, node_id, pkg_nv));
     Ok(pkg_nv)
   }
 
@@ -854,7 +883,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &mut self,
     entry: &NpmDependencyEntry,
     package_info: &NpmPackageInfo,
-    parent_path: &Rc<GraphPath>,
+    parent_path: GraphPathRef<'b>,
   ) -> Result<NodeId, NpmResolutionError> {
     debug_assert_eq!(entry.kind, NpmDependencyEntryKind::Dep);
     let parent_id = parent_path.node_id();
@@ -873,8 +902,12 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         child_id = ancestor.node_id();
       }
 
-      let new_path =
-        parent_path.with_id(child_id, entry.bare_specifier.clone(), child_nv);
+      let new_path: &GraphPath<'_> = parent_path.with_id(
+        self.graph.arena,
+        child_id,
+        entry.bare_specifier.clone(),
+        child_nv,
+      );
       if let Some(ancestor) = maybe_ancestor {
         // this node is circular, so we link it to the ancestor
         self.add_linked_circular_descendant(&ancestor, new_path);
@@ -896,7 +929,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     version_req: &VersionReq,
     package_info: &NpmPackageInfo,
     parent_id: Option<NodeId>,
-  ) -> Result<(Rc<PackageNv>, NodeId), NpmResolutionError> {
+  ) -> Result<(PackageNvRef<'b>, NodeId), NpmResolutionError> {
+    let arena = self.graph.arena;
     let info = self.version_resolver.resolve_best_package_version_info(
       version_req,
       package_info,
@@ -908,11 +942,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         .iter(),
     )?;
     let resolved_id = ResolvedId {
-      nv: Rc::new(PackageNv {
+      nv: arena.alloc(PackageNv {
         name: package_info.name.clone(),
         version: info.version.clone(),
       }),
-      peer_dependencies: Vec::new(),
+      peer_dependencies: BumpVec::new_in(arena),
     };
     let (_, node_id) = self.graph.get_or_create_for_id(&resolved_id);
     let pkg_nv = resolved_id.nv;
@@ -920,7 +954,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     let has_deps = if let Some(deps) = self.dep_entry_cache.get(&pkg_nv) {
       !deps.is_empty()
     } else {
-      let deps = self.dep_entry_cache.store(pkg_nv.clone(), info)?;
+      let deps = self.dep_entry_cache.store(pkg_nv, info)?;
       !deps.is_empty()
     };
 
@@ -954,13 +988,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           continue;
         }
 
-        let pkg_nv = self
-          .graph
-          .resolved_node_ids
-          .get(node_id)
-          .unwrap()
-          .nv
-          .clone();
+        let pkg_nv = self.graph.resolved_node_ids.get(node_id).unwrap().nv;
         let deps = if let Some(deps) = self.dep_entry_cache.get(&pkg_nv) {
           deps.clone()
         } else {
@@ -970,7 +998,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           let version_info = package_info
             .version_info(&pkg_nv)
             .map_err(NpmPackageVersionResolutionError::VersionNotFound)?;
-          self.dep_entry_cache.store(pkg_nv.clone(), version_info)?
+          self.dep_entry_cache.store(pkg_nv, version_info)?
         };
 
         (pkg_nv, deps)
@@ -1008,15 +1036,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
                 // this dependency was previously analyzed by another path
                 // so we don't attempt to resolve the version again
                 let child_id = *child_id;
-                let child_nv = self
-                  .graph
-                  .resolved_node_ids
-                  .get(child_id)
-                  .unwrap()
-                  .nv
-                  .clone();
+                let child_nv =
+                  self.graph.resolved_node_ids.get(child_id).unwrap().nv;
                 let maybe_ancestor = parent_path.find_ancestor(&child_nv);
                 let child_path = parent_path.with_id(
+                  self.graph.arena,
                   child_id,
                   dep.bare_specifier.clone(),
                   child_nv,
@@ -1050,7 +1074,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
               &dep.bare_specifier,
               dep,
               &package_info,
-              &parent_path,
+              parent_path,
             )?;
 
             // For optional peer dependencies, we want to resolve them if any future
@@ -1078,9 +1102,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
                     }
 
                     for optional_peer in peers {
-                      let peer_parent = GraphPathNodeOrRoot::Node(
-                        optional_peer.graph_path.clone(),
-                      );
+                      let peer_parent =
+                        GraphPathNodeOrRoot::Node(optional_peer.graph_path);
                       self.set_new_peer_dep(
                         &[&optional_peer.graph_path],
                         peer_parent,
@@ -1094,11 +1117,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
                   // store this for later if it's resolved for this version
                   self
                     .unresolved_optional_peers
-                    .entry(parent_nv.clone())
+                    .entry(parent_nv)
                     .or_default()
                     .push(UnresolvedOptionalPeer {
                       specifier: dep.bare_specifier.clone(),
-                      graph_path: parent_path.clone(),
+                      graph_path: parent_path,
                     });
                 }
               }
@@ -1119,7 +1142,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     specifier: &StackString,
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
-    ancestor_path: &Rc<GraphPath>,
+    ancestor_path: GraphPathRef<'b>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     debug_assert!(matches!(
       peer_dep.kind,
@@ -1170,9 +1193,9 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           if let Some(child_id) = self.find_matching_child(
             peer_dep,
             peer_package_info,
-            self.graph.root_packages.iter().map(|(nv, id)| (*id, nv)),
+            self.graph.root_packages.iter().map(|(nv, id)| (*id, *nv)),
           )? {
-            let peer_parent = GraphPathNodeOrRoot::Root(root_pkg_nv.clone());
+            let peer_parent = GraphPathNodeOrRoot::Root(root_pkg_nv);
             self.set_new_peer_dep(&path, peer_parent, specifier, child_id);
             return Ok(Some(child_id));
           }
@@ -1193,7 +1216,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         peer_package_info,
         Some(parent_id),
       )?;
-      let peer_parent = GraphPathNodeOrRoot::Node(ancestor_path.clone());
+      let peer_parent = GraphPathNodeOrRoot::Node(ancestor_path);
       self.set_new_peer_dep(&[ancestor_path], peer_parent, specifier, node_id);
       Ok(Some(node_id))
     } else {
@@ -1203,11 +1226,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
   fn find_peer_dep_in_node(
     &self,
-    path: &Rc<GraphPath>,
+    path: GraphPathRef<'b>,
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
     exclude_key: Option<&str>,
-  ) -> Result<Option<(GraphPathNodeOrRoot, NodeId)>, NpmResolutionError> {
+  ) -> Result<Option<(GraphPathNodeOrRoot<'b>, NodeId)>, NpmResolutionError> {
     let node_id = path.node_id();
     let resolved_node_id = self.graph.resolved_node_ids.get(node_id).unwrap();
     // check if this node itself is a match for
@@ -1237,14 +1260,14 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           let child_node_id = *child_node_id;
           (
             child_node_id,
-            &self.graph.resolved_node_ids.get(child_node_id).unwrap().nv,
+            self.graph.resolved_node_ids.get(child_node_id).unwrap().nv,
           )
         });
       self
         .find_matching_child(peer_dep, peer_package_info, children)
         .map(|maybe_child_id| {
           maybe_child_id.map(|child_id| {
-            let parent = GraphPathNodeOrRoot::Node(path.clone());
+            let parent = GraphPathNodeOrRoot::Node(path);
             (parent, child_id)
           })
         })
@@ -1254,8 +1277,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn add_peer_deps_to_path(
     &mut self,
     // path from the node above the resolved dep to just above the peer dep
-    path: &[&Rc<GraphPath>],
-    peer_deps: &[(&ResolvedIdPeerDep, Rc<PackageNv>)],
+    path: &[GraphPathRef<'b>],
+    peer_deps: &[(&ResolvedIdPeerDep<'b>, PackageNvRef<'b>)],
   ) {
     debug_assert!(!path.is_empty());
 
@@ -1304,7 +1327,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       let circular_descendants =
         graph_path_node.linked_circular_descendants.borrow().clone();
       for descendant in circular_descendants {
-        let path = descendant.get_path_to_ancestor_exclusive(new_node_id);
+        let path = descendant
+          .get_path_to_ancestor_exclusive(self.graph.arena, new_node_id);
         self.add_peer_deps_to_path(&path, peer_deps);
         descendant.change_id(new_node_id);
 
@@ -1320,7 +1344,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       // update the previous parent to have this as its child
       match graph_path_node.previous_node.as_ref().unwrap() {
         GraphPathNodeOrRoot::Root(pkg_id) => {
-          self.graph.root_packages.insert(pkg_id.clone(), new_node_id);
+          self.graph.root_packages.insert(pkg_id, new_node_id);
         }
         GraphPathNodeOrRoot::Node(parent_node_path) => {
           let parent_node_id = parent_node_path.node_id();
@@ -1336,23 +1360,17 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn set_new_peer_dep(
     &mut self,
     // path from the node above the resolved dep to just above the peer dep
-    path: &[&Rc<GraphPath>],
-    peer_dep_parent: GraphPathNodeOrRoot,
+    path: &[GraphPathRef<'b>],
+    peer_dep_parent: GraphPathNodeOrRoot<'b>,
     peer_dep_specifier: &StackString,
     peer_dep_id: NodeId,
   ) {
     debug_assert!(!path.is_empty());
-    let peer_dep_nv = self
-      .graph
-      .resolved_node_ids
-      .get(peer_dep_id)
-      .unwrap()
-      .nv
-      .clone();
+    let peer_dep_nv = self.graph.resolved_node_ids.get(peer_dep_id).unwrap().nv;
 
     let peer_dep = ResolvedIdPeerDep::ParentReference {
       parent: peer_dep_parent,
-      child_pkg_nv: peer_dep_nv.clone(),
+      child_pkg_nv: peer_dep_nv,
     };
 
     let top_node = path.last().unwrap();
@@ -1368,7 +1386,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       return;
     }
 
-    self.add_peer_deps_to_path(path, &[(&peer_dep, peer_dep_nv.clone())]);
+    self.add_peer_deps_to_path(path, &[(&peer_dep, peer_dep_nv)]);
 
     // now set the peer dependency
     let bottom_node = path.first().unwrap();
@@ -1379,8 +1397,12 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     );
 
     // queue next step
-    let new_path =
-      bottom_node.with_id(peer_dep_id, peer_dep_specifier.clone(), peer_dep_nv);
+    let new_path = bottom_node.with_id(
+      self.graph.arena,
+      peer_dep_id,
+      peer_dep_specifier.clone(),
+      peer_dep_nv,
+    );
     if let Some(ancestor_node) = maybe_circular_ancestor {
       // it's circular, so link this in step with the ancestor node
       ancestor_node
@@ -1405,11 +1427,12 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
   fn add_linked_circular_descendant(
     &mut self,
-    ancestor: &Rc<GraphPath>,
-    descendant: Rc<GraphPath>,
+    ancestor: GraphPathRef<'b>,
+    descendant: GraphPathRef<'b>,
   ) {
     let ancestor_node_id = ancestor.node_id();
-    let path = descendant.get_path_to_ancestor_exclusive(ancestor_node_id);
+    let path = descendant
+      .get_path_to_ancestor_exclusive(self.graph.arena, ancestor_node_id);
 
     let ancestor_resolved_id = self
       .graph
@@ -1426,15 +1449,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
           peer_dep,
           match &peer_dep {
             ResolvedIdPeerDep::ParentReference { child_pkg_nv, .. } => {
-              child_pkg_nv.clone()
+              *child_pkg_nv
             }
-            ResolvedIdPeerDep::SnapshotNodeId(node_id) => self
-              .graph
-              .resolved_node_ids
-              .get(*node_id)
-              .unwrap()
-              .nv
-              .clone(),
+            ResolvedIdPeerDep::SnapshotNodeId(node_id) => {
+              self.graph.resolved_node_ids.get(*node_id).unwrap().nv
+            }
           },
         )
       })
@@ -1460,7 +1479,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &self,
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
-    children: impl Iterator<Item = (NodeId, &'nv Rc<PackageNv>)>,
+    children: impl Iterator<Item = (NodeId, PackageNvRef<'b>)>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     for (child_id, pkg_id) in children {
       if pkg_id.name == peer_dep.name
@@ -1490,11 +1509,12 @@ mod test {
 
   #[test]
   fn resolved_id_tests() {
-    let mut ids = ResolvedNodeIds::default();
+    let arena = &Bump::new();
+    let mut ids = ResolvedNodeIds::new_in(arena);
     let node_id = NodeId(0);
     let resolved_id = ResolvedId {
-      nv: Rc::new(PackageNv::from_str("package@1.1.1").unwrap()),
-      peer_dependencies: Vec::new(),
+      nv: arena.alloc(PackageNv::from_str("package@1.1.1").unwrap()),
+      peer_dependencies: BumpVec::new_in(arena),
     };
     ids.set(node_id, resolved_id.clone());
     assert!(ids.get(node_id).is_some());
@@ -1502,8 +1522,8 @@ mod test {
     assert_eq!(ids.get_node_id(&resolved_id), Some(node_id));
 
     let resolved_id_new = ResolvedId {
-      nv: Rc::new(PackageNv::from_str("package@1.1.2").unwrap()),
-      peer_dependencies: Vec::new(),
+      nv: arena.alloc(PackageNv::from_str("package@1.1.2").unwrap()),
+      peer_dependencies: BumpVec::new_in(arena),
     };
     ids.set(node_id, resolved_id_new.clone());
     assert_eq!(ids.get_node_id(&resolved_id), None); // stale entry should have been removed
@@ -4001,6 +4021,7 @@ mod test {
 
   #[tokio::test]
   async fn graph_from_snapshot_dep_on_self() {
+    let arena = &Bump::new();
     // there are some lockfiles in the wild that when loading have a dependency
     // on themselves and causes a panic, so ensure this doesn't panic
     let snapshot = SerializedNpmResolutionSnapshot {
@@ -4026,7 +4047,7 @@ mod test {
     };
     let snapshot = NpmResolutionSnapshot::new(snapshot.into_valid().unwrap());
     // assert this doesn't panic
-    let _graph = Graph::from_snapshot(snapshot);
+    let _graph = Graph::from_snapshot(arena, snapshot);
   }
 
   #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4116,8 +4137,9 @@ mod test {
       snapshot
     }
 
+    let arena = &Bump::new();
     let snapshot = NpmResolutionSnapshot::new(Default::default());
-    let mut graph = Graph::from_snapshot(snapshot);
+    let mut graph = Graph::from_snapshot(arena, snapshot);
     let npm_version_resolver = NpmVersionResolver {
       types_node_version_req: None,
     };
@@ -4135,7 +4157,7 @@ mod test {
     let snapshot = graph.into_snapshot(&api).await.unwrap();
 
     {
-      let graph = Graph::from_snapshot(snapshot.clone());
+      let graph = Graph::from_snapshot(arena, snapshot.clone());
       let new_snapshot = graph.into_snapshot(&api).await.unwrap();
       assert_eq!(
         snapshot_to_serialized(&snapshot),
@@ -4143,7 +4165,7 @@ mod test {
         "recreated snapshot should be the same"
       );
       // create one again from the new snapshot
-      let graph = Graph::from_snapshot(new_snapshot.clone());
+      let graph = Graph::from_snapshot(arena, new_snapshot.clone());
       let new_snapshot2 = graph.into_snapshot(&api).await.unwrap();
       assert_eq!(
         snapshot_to_serialized(&snapshot),
@@ -4159,8 +4181,9 @@ mod test {
     api: TestNpmRegistryApi,
     reqs: Vec<&str>,
   ) -> NpmResolutionError {
+    let arena = &Bump::new();
     let snapshot = NpmResolutionSnapshot::new(Default::default());
-    let mut graph = Graph::from_snapshot(snapshot);
+    let mut graph = Graph::from_snapshot(arena, snapshot);
     let npm_version_resolver = NpmVersionResolver {
       types_node_version_req: None,
     };
