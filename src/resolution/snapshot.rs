@@ -34,6 +34,7 @@ use crate::registry::NpmPackageVersionDistInfo;
 use crate::registry::NpmPackageVersionInfo;
 use crate::registry::NpmRegistryApi;
 use crate::registry::NpmRegistryPackageInfoLoadError;
+use crate::registry::SmallNpmPackageInfo;
 use crate::NpmPackageCacheFolderId;
 use crate::NpmPackageId;
 use crate::NpmPackageIdDeserializationError;
@@ -299,7 +300,9 @@ impl NpmResolutionSnapshot {
     options: AddPkgReqsOptions<'_>,
   ) -> AddPkgReqsResult {
     enum InfoOrNv {
-      InfoResult(Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>),
+      InfoResult(
+        Result<Arc<SmallNpmPackageInfo>, NpmRegistryPackageInfoLoadError>,
+      ),
       Nv(PackageNv),
     }
     // convert the snapshot to a traversable graph
@@ -314,7 +317,7 @@ impl NpmResolutionSnapshot {
         let maybe_info = if let Some(nv) = maybe_nv {
           InfoOrNv::Nv(nv)
         } else {
-          InfoOrNv::InfoResult(api.package_info(&req.name).await)
+          InfoOrNv::InfoResult(api.package_versions(&req.name).await)
         };
         (req, maybe_info)
       })
@@ -338,11 +341,21 @@ impl NpmResolutionSnapshot {
       match info_or_nv {
         InfoOrNv::InfoResult(info_result) => {
           match info_result
-            .map_err(|err| err.into())
-            .and_then(|info| resolver.add_package_req(req, &info))
-          {
+            .map_err(|err| NpmResolutionError::from(err))
+            .map(async |info: Arc<SmallNpmPackageInfo>| {
+              resolver.add_package_req(req, &info).await
+            }) {
             Ok(nv) => {
-              results.push(Ok(nv.as_ref().clone()));
+              let nv = nv.await;
+              match nv {
+                Ok(nv) => results.push(Ok(nv.as_ref().clone())),
+                Err(err) => {
+                  if first_resolution_error.is_none() {
+                    first_resolution_error = Some(err.clone());
+                  }
+                  results.push(Err(err));
+                }
+              }
             }
             Err(err) => {
               if first_resolution_error.is_none() {
@@ -979,7 +992,7 @@ pub async fn snapshot_from_lockfile<'a>(
   let get_version_infos = || {
     FuturesOrdered::from_iter(pkg_nvs.iter().map(|nv| async move {
       let package_info = api
-        .package_info(&nv.name)
+        .package_version_info(nv, params.patch_packages)
         .await
         .map_err(SnapshotFromLockfileError::PackageInfoLoad)?;
       Ok((package_info, nv))
@@ -987,16 +1000,13 @@ pub async fn snapshot_from_lockfile<'a>(
   };
   let mut version_infos = get_version_infos();
   let mut i = 0;
-  let mut packages = Vec::with_capacity(incomplete_snapshot.packages.len());
+  let mut packages: Vec<SerializedNpmResolutionSnapshotPackage> =
+    Vec::with_capacity(incomplete_snapshot.packages.len());
   while let Some(result) = version_infos.next().await {
     let result = result
       .as_ref()
       .map_err(|e: &SnapshotFromLockfileError| e.clone())
-      .and_then(|(package_info, nv)| {
-        package_info
-          .version_info(nv, params.patch_packages)
-          .map_err(|e| SnapshotFromLockfileError::VersionNotFound { source: e })
-      });
+      .map(|(package_info, _)| package_info);
     match result {
       Ok(version_info) => {
         let snapshot_package = &incomplete_snapshot.packages[i];

@@ -6,6 +6,7 @@ use deno_semver::package::PackageReq;
 use deno_semver::StackString;
 use deno_semver::Version;
 use deno_semver::VersionReq;
+use futures::FutureExt;
 use futures::StreamExt;
 use indexmap::IndexSet;
 use log::debug;
@@ -28,6 +29,7 @@ use crate::registry::NpmPackageInfo;
 use crate::registry::NpmPackageVersionInfo;
 use crate::registry::NpmRegistryApi;
 use crate::registry::NpmRegistryPackageInfoLoadError;
+use crate::registry::SmallNpmPackageInfo;
 use crate::resolution::collections::OneDirectionalLinkedList;
 use crate::resolution::snapshot::SnapshotPackageCopyIndexResolver;
 use crate::NpmResolutionPackageSystemInfo;
@@ -641,11 +643,9 @@ impl Graph {
         .or_default()
         .push(pkg_id.clone());
 
-      // at this point the api should have this cached
-      let package_info = api.package_info(&pkg_id.nv.name).await?;
-      let version_info = package_info
-        .version_info(&pkg_id.nv, patch_packages)
-        .unwrap();
+      // at this point the api should have this cache
+      let version_info =
+        api.package_version_info(&pkg_id.nv, patch_packages).await?;
 
       let mut dependencies = HashMap::with_capacity(node.children.len());
       for (specifier, child_id) in &node.children {
@@ -830,10 +830,10 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     }
   }
 
-  pub fn add_package_req(
+  pub async fn add_package_req(
     &mut self,
     package_req: &PackageReq,
-    package_info: &NpmPackageInfo,
+    package_info: &SmallNpmPackageInfo,
   ) -> Result<Rc<PackageNv>, NpmResolutionError> {
     if let Some(nv) = self.graph.get_req_nv(package_req) {
       return Ok(nv.clone()); // already added
@@ -852,12 +852,14 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     let (pkg_nv, node_id) = match existing_root {
       Some(existing) => existing,
       None => {
-        let (pkg_nv, node_id) = self.resolve_node_from_info(
-          &package_req.name,
-          &package_req.version_req,
-          package_info,
-          None,
-        )?;
+        let (pkg_nv, node_id) = self
+          .resolve_node_from_info(
+            &package_req.name,
+            &package_req.version_req,
+            package_info,
+            None,
+          )
+          .await?;
         self
           .pending_unresolved_nodes
           .push_back(GraphPath::for_root(node_id, pkg_nv.clone()));
@@ -872,20 +874,22 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     Ok(pkg_nv)
   }
 
-  fn analyze_dependency(
+  async fn analyze_dependency(
     &mut self,
     entry: &NpmDependencyEntry,
-    package_info: &NpmPackageInfo,
+    package_info: &SmallNpmPackageInfo,
     parent_path: &Rc<GraphPath>,
   ) -> Result<NodeId, NpmResolutionError> {
     debug_assert_eq!(entry.kind, NpmDependencyEntryKind::Dep);
     let parent_id = parent_path.node_id();
-    let (child_nv, mut child_id) = self.resolve_node_from_info(
-      &entry.name,
-      &entry.version_req,
-      package_info,
-      Some(parent_id),
-    )?;
+    let (child_nv, mut child_id) = self
+      .resolve_node_from_info(
+        &entry.name,
+        &entry.version_req,
+        package_info,
+        Some(parent_id),
+      )
+      .await?;
     // Some packages may resolves to themselves as a dependency. If this occurs,
     // just ignore adding these as dependencies because this is likely a mistake
     // in the package.
@@ -912,14 +916,14 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     Ok(child_id)
   }
 
-  fn resolve_node_from_info(
+  async fn resolve_node_from_info(
     &mut self,
     pkg_req_name: &str,
     version_req: &VersionReq,
-    package_info: &NpmPackageInfo,
+    package_info: &SmallNpmPackageInfo,
     parent_id: Option<NodeId>,
   ) -> Result<(Rc<PackageNv>, NodeId), NpmResolutionError> {
-    let info = self.version_resolver.resolve_best_package_version_info(
+    let version = self.version_resolver.resolve_best_package_version_info(
       version_req,
       package_info,
       self
@@ -932,7 +936,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     let resolved_id = ResolvedId {
       nv: Rc::new(PackageNv {
         name: package_info.name.clone(),
-        version: info.version.clone(),
+        version: version.clone(),
       }),
       peer_dependencies: Vec::new(),
     };
@@ -942,7 +946,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     let has_deps = if let Some(deps) = self.dep_entry_cache.get(&pkg_nv) {
       !deps.is_empty()
     } else {
-      let deps = self.dep_entry_cache.store(pkg_nv.clone(), info)?;
+      let info = self
+        .api
+        .package_version_info(&pkg_nv, self.version_resolver.patch_packages)
+        .await?;
+      let deps = self.dep_entry_cache.store(pkg_nv.clone(), &info)?;
       !deps.is_empty()
     };
 
@@ -988,11 +996,12 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         } else {
           // the api is expected to have cached this at this point, so no
           // need to parallelize
-          let package_info = self.api.package_info(&pkg_nv.name).await?;
-          let version_info = package_info
-            .version_info(&pkg_nv, self.version_resolver.patch_packages)
-            .map_err(NpmPackageVersionResolutionError::VersionNotFound)?;
-          self.dep_entry_cache.store(pkg_nv.clone(), version_info)?
+          let version_info = self
+            .api
+            .package_version_info(&pkg_nv, self.version_resolver.patch_packages)
+            .await?;
+
+          self.dep_entry_cache.store(pkg_nv.clone(), &version_info)?
         };
 
         (pkg_nv, deps)
@@ -1004,7 +1013,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       let mut infos = futures::stream::FuturesOrdered::from_iter(
         child_deps
           .iter()
-          .map(|dep| self.api.package_info(&dep.name)),
+          .map(|dep| self.api.package_versions(&dep.name)),
       );
 
       let mut child_deps_iter = child_deps.iter();
@@ -1054,7 +1063,9 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
                 child_id
               }
               None => {
-                self.analyze_dependency(dep, &package_info, &parent_path)?
+                self
+                  .analyze_dependency(dep, &package_info, &parent_path)
+                  .await?
               }
             };
 
@@ -1087,12 +1098,14 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
             // we need to re-evaluate peer dependencies every time and can't
             // skip over them because they might be evaluated differently based
             // on the current path
-            let maybe_new_id = self.resolve_peer_dep(
-              &dep.bare_specifier,
-              dep,
-              &package_info,
-              &parent_path,
-            )?;
+            let maybe_new_id = self
+              .resolve_peer_dep(
+                &dep.bare_specifier,
+                dep,
+                &package_info,
+                &parent_path,
+              )
+              .await?;
 
             #[cfg(feature = "tracing")]
             if let Some(child_id) = maybe_new_id {
@@ -1174,11 +1187,11 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     Ok(())
   }
 
-  fn resolve_peer_dep(
+  async fn resolve_peer_dep(
     &mut self,
     specifier: &StackString,
     peer_dep: &NpmDependencyEntry,
-    peer_package_info: &NpmPackageInfo,
+    peer_package_info: &SmallNpmPackageInfo,
     ancestor_path: &Rc<GraphPath>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     debug_assert!(matches!(
@@ -1247,15 +1260,17 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     // to resolve based on the package info
     if !peer_dep.kind.is_optional() {
       let parent_id = ancestor_path.node_id();
-      let (_, node_id) = self.resolve_node_from_info(
-        &peer_dep.name,
-        peer_dep
-          .peer_dep_version_req
-          .as_ref()
-          .unwrap_or(&peer_dep.version_req),
-        peer_package_info,
-        Some(parent_id),
-      )?;
+      let (_, node_id) = self
+        .resolve_node_from_info(
+          &peer_dep.name,
+          peer_dep
+            .peer_dep_version_req
+            .as_ref()
+            .unwrap_or(&peer_dep.version_req),
+          peer_package_info,
+          Some(parent_id),
+        )
+        .await?;
       let peer_parent = GraphPathNodeOrRoot::Node(ancestor_path.clone());
       self.set_new_peer_dep(&[ancestor_path], peer_parent, specifier, node_id);
       Ok(Some(node_id))
@@ -1268,7 +1283,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &self,
     path: &Rc<GraphPath>,
     peer_dep: &NpmDependencyEntry,
-    peer_package_info: &NpmPackageInfo,
+    peer_package_info: &SmallNpmPackageInfo,
     exclude_key: Option<&str>,
     original_resolving_path: &Rc<GraphPath>,
   ) -> Result<Option<(GraphPathNodeOrRoot, NodeId)>, NpmResolutionError> {
@@ -1574,7 +1589,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn find_matching_child_for_peer_dep<'nv>(
     &self,
     peer_dep: &NpmDependencyEntry,
-    peer_package_info: &NpmPackageInfo,
+    peer_package_info: &SmallNpmPackageInfo,
     children: impl Iterator<Item = (NodeId, &'nv Rc<PackageNv>)>,
     original_resolving_path: &Rc<GraphPath>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
@@ -4778,7 +4793,8 @@ mod test {
     for req in options.reqs {
       let req = PackageReq::from_str(req).unwrap();
       resolver
-        .add_package_req(&req, &api.package_info(&req.name).await.unwrap())
+        .add_package_req(&req, &api.package_versions(&req.name).await.unwrap())
+        .await
         .unwrap();
     }
 
@@ -4844,7 +4860,8 @@ mod test {
     for req in reqs {
       let req = PackageReq::from_str(req).unwrap();
       resolver
-        .add_package_req(&req, &api.package_info(&req.name).await.unwrap())
+        .add_package_req(&req, &api.package_versions(&req.name).await.unwrap())
+        .await
         .unwrap();
     }
 

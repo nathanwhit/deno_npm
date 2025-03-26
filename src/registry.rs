@@ -31,6 +31,13 @@ pub struct NpmPackageInfo {
   pub dist_tags: HashMap<String, Version>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct SmallNpmPackageInfo {
+  pub name: PackageName,
+  pub versions: Vec<Version>,
+  pub dist_tags: HashMap<String, Version>,
+}
+
 impl NpmPackageInfo {
   pub fn version_info<'a>(
     &'a self,
@@ -362,6 +369,9 @@ pub enum NpmRegistryPackageInfoLoadError {
   #[class(inherit)]
   #[error(transparent)]
   LoadError(Arc<dyn deno_error::JsErrorClass>),
+  #[class(inherit)]
+  #[error(transparent)]
+  VersionNotFound(NpmPackageVersionNotFound),
 }
 
 /// A trait for getting package information from the npm registry.
@@ -370,15 +380,26 @@ pub enum NpmRegistryPackageInfoLoadError {
 /// [`mark_force_reload`] method if it has a cache mechanism.
 #[async_trait(?Send)]
 pub trait NpmRegistryApi {
-  /// Gets the package information from the npm registry.
-  ///
-  /// Note: The implementer should handle requests for the same npm
-  /// package name concurrently and try not to make the same request
-  /// to npm at the same time.
-  async fn package_info(
+  // /// Gets the package information from the npm registry.
+  // ///
+  // /// Note: The implementer should handle requests for the same npm
+  // /// package name concurrently and try not to make the same request
+  // /// to npm at the same time.
+  // async fn package_info(
+  //   &self,
+  //   name: &str,
+  // ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>;
+
+  async fn package_versions(
     &self,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>;
+  ) -> Result<Arc<SmallNpmPackageInfo>, NpmRegistryPackageInfoLoadError>;
+
+  async fn package_version_info(
+    &self,
+    nv: &PackageNv,
+    patch_packages: &HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+  ) -> Result<Arc<NpmPackageVersionInfo>, NpmRegistryPackageInfoLoadError>;
 
   /// Marks that new requests for package information should retrieve it
   /// from the npm registry
@@ -539,16 +560,51 @@ impl TestNpmRegistryApi {
 
 #[async_trait(?Send)]
 impl NpmRegistryApi for TestNpmRegistryApi {
-  async fn package_info(
+  async fn package_versions(
     &self,
     name: &str,
-  ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+  ) -> Result<Arc<SmallNpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
     let infos = self.package_infos.borrow();
-    Ok(infos.get(name).cloned().ok_or_else(|| {
-      NpmRegistryPackageInfoLoadError::PackageNotExists {
-        package_name: name.into(),
-      }
-    })?)
+    Ok(Arc::new(SmallNpmPackageInfo {
+      name: name.into(),
+      versions: infos
+        .get(name)
+        .cloned()
+        .ok_or_else(|| NpmRegistryPackageInfoLoadError::PackageNotExists {
+          package_name: name.into(),
+        })?
+        .versions
+        .keys()
+        .cloned()
+        .collect(),
+      dist_tags: infos
+        .get(name)
+        .cloned()
+        .ok_or_else(|| NpmRegistryPackageInfoLoadError::PackageNotExists {
+          package_name: name.into(),
+        })?
+        .dist_tags
+        .clone(),
+    }))
+  }
+
+  async fn package_version_info(
+    &self,
+    nv: &PackageNv,
+    patch_packages: &HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+  ) -> Result<Arc<NpmPackageVersionInfo>, NpmRegistryPackageInfoLoadError> {
+    let infos = self.package_infos.borrow();
+    Ok(
+      infos
+        .get(nv.name.as_str())
+        .cloned()
+        .ok_or_else(|| NpmRegistryPackageInfoLoadError::PackageNotExists {
+          package_name: nv.name.as_str().into(),
+        })?
+        .version_info(nv, patch_packages)
+        .map(|v| Arc::new(v.clone()))
+        .map_err(NpmRegistryPackageInfoLoadError::VersionNotFound)?,
+    )
   }
 }
 

@@ -39,7 +39,7 @@ mod deserialization {
     build_rt().block_on(async {
       // ensure the fs cache is populated
       let _ = RealBenchRegistryApi::default()
-        .package_info("next")
+        .package_versions("next")
         .await
         .unwrap();
     });
